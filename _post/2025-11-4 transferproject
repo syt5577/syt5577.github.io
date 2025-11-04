@@ -1,0 +1,171 @@
+import pandas as pd
+import numpy as np
+
+def get_amounts_from_console():
+    """
+    通过控制台获取总金额
+    """
+    print("=" * 50)
+    print("设备金额分摊系统")
+    print("=" * 50)
+    
+    # 获取总物资金额
+    while True:
+        try:
+            material_input = input("请输入总物资金额（元）: ").replace(',', '')
+            total_material = float(material_input)
+            break
+        except ValueError:
+            print("输入错误，请输入有效的数字!")
+    
+    # 获取总施工金额
+    while True:
+        try:
+            construction_input = input("请输入总施工金额（元）: ").replace(',', '')
+            total_construction = float(construction_input)
+            break
+        except ValueError:
+            print("输入错误，请输入有效的数字!")
+    
+    return total_material, total_construction
+
+def process_equipment_data(file_path):
+    """
+    处理设备数据并进行金额分摊
+    """
+    # 获取分摊金额
+    total_material, total_construction = get_amounts_from_console()
+    
+    # 读取和处理数据
+    df = pd.read_excel(file_path, skiprows=1, usecols=lambda x: 'Unnamed' not in str(x))
+    df = df.iloc[:-1, :]
+    
+    # 计算不含税单价
+    df['不含税单个单价'] = df['采购材料费'] / df['数量']
+    df['数量'] = pd.to_numeric(df['数量'], errors='coerce').fillna(0).astype(int)
+    
+    print(f"\n开始处理数据...")
+    print(f"总物资金额: {total_material:,.2f}元")
+    print(f"总施工金额: {total_construction:,.2f}元")
+    
+    # 计算总不含税金额（用于分摊比例）
+    total_unit_price = (df['不含税单个单价'] * df['数量']).sum()
+    print(f"总不含税金额: {total_unit_price:,.2f}元")
+    
+    # 拆分数据行并进行金额分摊
+    expanded_rows = []
+    new_index = 1
+    
+    for index, row in df.iterrows():
+        quantity = int(row['数量'])
+        unit_price = row['不含税单个单价']
+        
+        # 计算这个设备的总不含税金额
+        device_total_unit_price = unit_price * quantity
+        
+        # 计算分摊比例（基于设备的不含税金额占比）
+        material_ratio = device_total_unit_price / total_unit_price
+        construction_ratio = device_total_unit_price / total_unit_price
+        
+        print(f"处理第{index+1}行: {row['固定资产名称']}, 数量: {quantity}, 单价: {unit_price:.2f}")
+        
+        for i in range(quantity):
+            new_row = row.copy()
+            new_row['序号'] = new_index
+            new_row['数量'] = 1
+            new_row['不含税金额（元）'] = unit_price
+            
+            # 分摊物资金额（按设备总不含税金额比例分摊到每个设备）
+            new_row['分摊好的物资价格'] = (material_ratio * total_material) / quantity
+            
+            # 分摊施工金额（按设备总不含税金额比例分摊到每个设备）
+            new_row['施工价格分摊'] = (construction_ratio * total_construction) / quantity
+            
+            expanded_rows.append(new_row)
+            new_index += 1
+            
+            print(f"  创建子行 {i+1}: 序号={new_index-1}, 分摊物资={new_row['分摊好的物资价格']:.2f}, 分摊施工={new_row['施工价格分摊']:.2f}")
+    
+    # 创建结果DataFrame
+    result_df = pd.DataFrame(expanded_rows)
+    result_df = result_df.reset_index(drop=True)
+    
+    # 验证分摊结果
+    material_total = result_df['分摊好的物资价格'].sum()
+    construction_total = result_df['施工价格分摊'].sum()
+    
+    print(f"\n分摊验证:")
+    print(f"物资 - 目标: {total_material:,.2f}, 实际: {material_total:,.2f}, 差异: {total_material - material_total:,.2f}")
+    print(f"施工 - 目标: {total_construction:,.2f}, 实际: {construction_total:,.2f}, 差异: {total_construction - construction_total:,.2f}")
+    
+    # 如果差异较大，进行微调
+    if abs(total_material - material_total) > 0.01:
+        print("进行物资金额微调...")
+        result_df.loc[0, '分摊好的物资价格'] += (total_material - material_total)
+        material_total = result_df['分摊好的物资价格'].sum()
+        print(f"微调后物资金额: {material_total:,.2f}")
+    
+    if abs(total_construction - construction_total) > 0.01:
+        print("进行施工金额微调...")
+        result_df.loc[0, '施工价格分摊'] += (total_construction - construction_total)
+        construction_total = result_df['施工价格分摊'].sum()
+        print(f"微调后施工金额: {construction_total:,.2f}")
+    
+    return result_df, total_material, total_construction
+
+def save_and_display_results(result_df, file_path, material_amount, construction_amount):
+    """
+    保存结果并显示摘要
+    """
+    # 生成输出文件名
+    output_path = file_path.replace('.xlsx', f'_分摊结果_{material_amount:.0f}元物资_{construction_amount:.0f}元施工.xlsx')
+    
+    # 保存结果
+    result_df.to_excel(output_path, index=False)
+    
+    print(f"\n处理完成! 文件已保存为: {output_path}")
+    
+    # 显示前几行结果供验证
+    print("\n前5行结果预览:")
+    preview_columns = ['序号', '固定资产名称', '规格型号', '数量', '不含税单个单价', 
+                      '分摊好的物资价格', '施工价格分摊', '使用部门', '存放地点']
+    available_columns = [col for col in preview_columns if col in result_df.columns]
+    print(result_df[available_columns].head().to_string(index=False))
+    
+    # 显示汇总统计
+    print(f"\n汇总统计:")
+    print(f"总设备数量: {len(result_df)}")
+    print(f"总物资金额: {result_df['分摊好的物资价格'].sum():,.2f}元")
+    print(f"总施工金额: {result_df['施工价格分摊'].sum():,.2f}元")
+    print(f"设备种类: {result_df['固定资产名称'].nunique()}种")
+    
+    # 按部门汇总
+    if '使用部门' in result_df.columns:
+        dept_summary = result_df.groupby('使用部门').agg({
+            '固定资产名称': 'count',
+            '分摊好的物资价格': 'sum',
+            '施工价格分摊': 'sum'
+        }).rename(columns={'固定资产名称': '设备数量'})
+        
+        print(f"\n按部门汇总:")
+        print(dept_summary.to_string())
+
+# 主程序
+if __name__ == "__main__":
+    # 文件路径 - 请根据实际情况修改
+    file_path = "C:/Users/Administrator/Desktop/工作站/11.4工作站/2020JV11东供水厂设备更新项目转资明细表.xlsx"
+    
+    try:
+        # 处理数据并分摊金额
+        result_df, material_amount, construction_amount = process_equipment_data(file_path)
+        
+        # 保存结果并显示摘要
+        save_and_display_results(result_df, file_path, material_amount, construction_amount)
+        
+    except FileNotFoundError:
+        print(f"错误: 找不到文件 {file_path}")
+        print("请检查文件路径是否正确")
+    except Exception as e:
+        print(f"处理过程中出现错误: {str(e)}")
+        import traceback
+        traceback.print_exc()
