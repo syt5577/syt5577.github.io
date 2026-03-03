@@ -1,0 +1,258 @@
+import pandas as pd
+import requests
+import json
+import re
+import os
+import time
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+from collections import defaultdict
+
+BASE_FILE = r'C:\Users\Administrator\Desktop\更新test\merge\2017-至今在建项目情况汇总表采购.xlsx'
+DEPT_FILES = [
+    r'C:\Users\Administrator\Desktop\更新test\merge\2017-至今在建项目情况汇总表采购.xlsx',
+    r'C:\Users\Administrator\Desktop\更新test\merge\2017-至今在建项目情况汇总表辅助.xlsx',
+    r'C:\Users\Administrator\Desktop\更新test\merge\2017-至今在建项目情况汇总表机动.xlsx'
+]
+
+PROJECT_NAME_COL = "项目名称"
+X_COL = "项目负责人描述项目进度（2026.1）"
+Y_COL = "项目负责人描述项目进度（2026.2）"
+DEPT_COL = "主责部门"
+
+DIFY_API_URL = "https://api.dify.ai/v1/workflows/run"
+DIFY_API_KEY = "app-UdAhRYdfdvqdahSBgOzxCnQA"
+WORKFLOW_ID = "你的工作流ID"
+
+SMTP_SERVER = "smtphz.qiye.163.com"
+SMTP_PORT = 25
+SENDER_EMAIL = "shanyutian@yansanveolia.com"
+SENDER_PASSWORD = "QMBMQjHYQn2wG1@C"
+
+DEPT_EMAIL_MAP = {
+    "采购部": "shanyutian@yansanveolia.com",
+    "辅助支持中心": "shanyutian@yansanveolia.com",
+    "机动工程部": "shanyutian@yansanveolia.com",
+    "西供水厂": "shanyutian@yansanveolia.com",
+    "东供水厂": "shanyutian@yansanveolia.com",
+    "财务部": "shanyutian@yansanveolia.com",
+}
+
+BATCH_SIZE = 5
+SLEEP_TIME = 2
+SEND_EMAIL = True
+TEST_MODE = True
+
+def send_consolidated_email(to_email, projects_list, dept_name=""):
+    if not to_email:
+        return
+    rows = ""
+    for p in projects_list:
+        color = "red" if "预警" in p['审查建议'] else "green"
+        rows += f"""
+        <tr>
+            <td style="padding:8px; border:1px solid #ddd;">{p['项目名称']}</td>
+            <td style="padding:8px; border:1px solid #ddd; color:{color};">{p['审查建议'].replace(chr(10), '<br>')}</td>
+        </tr>
+        """
+    html = f"""
+    <html>
+    <body>
+        <h3>项目进度审查结果通知</h3>
+        <p>您好，以下是您负责的项目中需要关注的问题：</p>
+        <table style="border-collapse:collapse; width:100%;">
+            <thead><tr style="background:#f2f2f2;"><th>项目名称</th><th>审查建议</th></tr></thead>
+            <tbody>{rows}</tbody>
+        </table>
+        <p>请根据建议及时更新项目进度。如有疑问，请联系项目管理办公室。</p>
+        <p>此为自动发送邮件，请勿回复。</p>
+    </body>
+    </html>
+    """
+    msg = MIMEMultipart()
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = to_email
+    msg['Subject'] = f"【项目进度审查】您有 {len(projects_list)} 个项目需要关注"
+    msg.attach(MIMEText(html, 'html', 'utf-8'))
+    try:
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        print(f"邮件已发送至 {to_email}（{dept_name}）")
+    except Exception as e:
+        print(f"发送失败 {to_email}: {e}")
+
+print("=" * 50)
+print("步骤1：合并部门文件")
+print("=" * 50)
+
+print(f"读取基准文件：{BASE_FILE}")
+df_base = pd.read_excel(BASE_FILE)
+required_cols = [PROJECT_NAME_COL, X_COL, DEPT_COL]
+for col in required_cols:
+    if col not in df_base.columns:
+        raise ValueError(f"基准文件中缺少必要的列：{col}")
+df_base = df_base[required_cols].dropna(subset=[PROJECT_NAME_COL])
+df_base[PROJECT_NAME_COL] = df_base[PROJECT_NAME_COL].str.strip()
+print(f"基准文件共有 {len(df_base)} 个项目")
+
+merged_y = pd.Series(index=df_base[PROJECT_NAME_COL], dtype=object)
+for file in DEPT_FILES:
+    if not os.path.exists(file):
+        print(f"警告：文件 {file} 不存在，跳过")
+        continue
+    print(f"处理部门文件：{file}")
+    df_dept = pd.read_excel(file)
+    if PROJECT_NAME_COL not in df_dept.columns or Y_COL not in df_dept.columns:
+        print(f"警告：文件 {file} 缺少必要的列，跳过")
+        continue
+    df_dept = df_dept[[PROJECT_NAME_COL, Y_COL]].dropna(subset=[PROJECT_NAME_COL])
+    df_dept[PROJECT_NAME_COL] = df_dept[PROJECT_NAME_COL].str.strip()
+    temp_series = df_dept.set_index(PROJECT_NAME_COL)[Y_COL]
+    merged_y.update(temp_series)
+
+df_base[Y_COL] = df_base[PROJECT_NAME_COL].map(merged_y)
+missing_y = df_base[Y_COL].isna().sum()
+if missing_y > 0:
+    print(f"有 {missing_y} 个项目未找到本月进度，将在JSON中留空")
+
+ignore_keywords = ["待转资", "转资中", "竣工决算审计"]
+original_count = len(df_base)
+df_base = df_base[~df_base[X_COL].str.contains('|'.join(ignore_keywords), na=False)]
+filtered_count = len(df_base)
+print(f"过滤掉 {original_count - filtered_count} 个转资相关项目，剩余 {filtered_count} 个项目")
+
+if filtered_count == 0:
+    print("没有需要审查的项目，程序退出。")
+    exit()
+
+df_to_review = df_base[[PROJECT_NAME_COL, X_COL, Y_COL, DEPT_COL]].copy()
+
+if TEST_MODE:
+    df_to_review = df_to_review.head(20).copy()
+    print(f"测试模式：仅处理前 {len(df_to_review)} 个项目")
+
+data_list = df_to_review.to_dict(orient='records')
+print(f"待审查项目数：{len(data_list)}")
+
+print("\n" + "=" * 50)
+print("步骤2：调用Dify工作流进行审查")
+print("=" * 50)
+
+def call_dify_batch(batch):
+    headers = {
+        "Authorization": f"Bearer {DIFY_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "workflow_id": WORKFLOW_ID,
+        "inputs": {
+            "project_file": json.dumps(batch, ensure_ascii=False)
+        },
+        "response_mode": "blocking",
+        "user": "system"
+    }
+    try:
+        resp = requests.post(DIFY_API_URL, headers=headers, json=payload, timeout=60)
+        if resp.status_code != 200:
+            print(f"请求失败，状态码 {resp.status_code}，响应：{resp.text[:200]}")
+            return None
+        result = resp.json()
+        raw_text = result['data']['outputs']['text']
+        clean_json = re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL).strip()
+        clean_json = clean_json.replace('```json', '').replace('```', '').strip()
+        return json.loads(clean_json)
+    except Exception as e:
+        print(f"请求异常：{e}")
+        return None
+
+all_reviews = []
+for i in range(0, len(data_list), BATCH_SIZE):
+    batch = data_list[i:i+BATCH_SIZE]
+    print(f"处理第 {i//BATCH_SIZE+1} 批，共 {len(batch)} 个项目")
+    reviews = call_dify_batch(batch)
+    if reviews:
+        all_reviews.extend(reviews)
+    else:
+        print("该批次失败，请检查日志")
+    time.sleep(SLEEP_TIME)
+
+print(f"共获得 {len(all_reviews)} 条审查建议")
+
+if len(all_reviews) != len(data_list):
+    print(f"警告：审查建议数量 ({len(all_reviews)}) 与待审查项目数 ({len(data_list)}) 不一致，请检查")
+
+print("\n" + "=" * 50)
+print("步骤3：合并审查建议")
+print("=" * 50)
+
+review_dict = {}
+notify_dict = {}
+for item in all_reviews:
+    name = item.get('项目名称', '').strip()
+    if name:
+        review_dict[name] = item.get('审查建议', '')
+        if '通知部门' in item:
+            notify_dict[name] = item['通知部门']
+
+df_to_review['审查建议'] = df_to_review[PROJECT_NAME_COL].map(review_dict)
+
+def get_notify_depts(row):
+    name = row[PROJECT_NAME_COL]
+    if name in notify_dict:
+        return notify_dict[name]
+    else:
+        return [row[DEPT_COL]]
+
+df_to_review['通知部门'] = df_to_review.apply(get_notify_depts, axis=1)
+
+unmatched = df_to_review[df_to_review['审查建议'].isna()]
+if not unmatched.empty:
+    print("以下项目未匹配到审查建议（可能名称不一致或LLM未返回）：")
+    print(unmatched[[PROJECT_NAME_COL]].to_string(index=False))
+
+df_to_review = df_to_review.dropna(subset=['审查建议'])
+
+if SEND_EMAIL:
+    print("\n" + "=" * 50)
+    print("步骤4：发送邮件通知（仅限预警项目）")
+    print("=" * 50)
+
+    df_warning = df_to_review[df_to_review['审查建议'].str.contains('预警', na=False)].copy()
+    print(f"预警项目数：{len(df_warning)}")
+
+    if df_warning.empty:
+        print("没有预警项目，跳过邮件发送。")
+    else:
+        dept_to_projects = defaultdict(list)
+        for _, row in df_warning.iterrows():
+            depts = row['通知部门']
+            if isinstance(depts, str):
+                depts = [d.strip() for d in depts.split(',')]
+            elif not isinstance(depts, list):
+                depts = [str(depts)]
+            for dept in depts:
+                dept = dept.strip()
+                dept_to_projects[dept].append({
+                    '项目名称': row[PROJECT_NAME_COL],
+                    '审查建议': row['审查建议']
+                })
+
+        for dept, projects in dept_to_projects.items():
+            email = DEPT_EMAIL_MAP.get(dept)
+            if email:
+                send_consolidated_email(email, projects, dept)
+            else:
+                print(f"部门 {dept} 没有配置邮箱，跳过")
+else:
+    print("\n邮件发送已关闭（SEND_EMAIL = False）")
+
+output_excel = f"审查结果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+df_to_review.to_excel(output_excel, index=False)
+print(f"\n审查结果已保存至 {output_excel}")
+
+print("\n全部流程执行完毕！")
